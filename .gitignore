@@ -1,0 +1,10 @@
+build/
+dist/
+instalador/
+*.spec
+__pycache__/
+*.pyc
+config.json
+_viejos/
+Claude outputs/
+LEEME.txt
