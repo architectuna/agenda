@@ -27,7 +27,7 @@ import recurring_ical_events
 import requests
 
 APP = "Agenda"
-VERSION = "1.2"
+VERSION = "1.3"
 ATAJO_TEXTO = "Ctrl + Alt + A"
 
 
@@ -51,6 +51,7 @@ CFG_BASE = {
     "dias": 7,
     "refresco_min": 10,
     "opacidad": 0.85,
+    "alto_max": 520,        # alto máximo de la lista de eventos, en píxeles
 }
 
 BG = "#111111"
@@ -61,7 +62,11 @@ CAMPO = "#1C1C1C"
 VERDE = "#81C784"
 FUENTE = "Segoe UI"
 ANCHO = 320
-MAX_EVENTOS = 40
+MAX_EVENTOS = 120
+ALTO_MIN = 120
+ALTO_BASE = 520
+BARRA = "#5A5A5A"
+BARRA_ACTIVA = "#9A9A9A"
 PALETA = ["#FFCA01", "#4FC3F7", "#81C784", "#F48FB1", "#CE93D8", "#FFAB91", "#B0BEC5", "#FFF59D"]
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -457,6 +462,10 @@ AYUDA = [
           "volvé a presionarlo, o hacé clic en otra ventana, y regresa al fondo."),
     ("h", "Otros ajustes"),
     ("p", "• Arrastralo con el mouse para moverlo; recuerda la posición.\n"
+          "• Arrastrá su borde inferior para fijar el alto máximo. Si los eventos no entran, "
+          "desplazá la lista con la rueda del mouse o con la barra fina de la derecha.\n"
+          "• La hora de arriba a la derecha es la de la última actualización; "
+          "hacé clic en ella para actualizar.\n"
           "• Clic derecho → Días a mostrar / Opacidad.\n"
           "• Se actualiza solo cada 10 minutos, o con clic derecho → Actualizar."),
     ("h", "Bueno saber"),
@@ -536,13 +545,59 @@ class Widget:
         self.root.geometry(f"+{self.cfg['x']}+{self.cfg['y']}")
         tk.Frame(self.root, bg=BG, width=ANCHO, height=0).pack()  # ancho fijo
 
-        self.cuerpo = tk.Frame(self.root, bg=BG, padx=16, pady=14)
-        self.cuerpo.pack(fill="both", expand=True)
+        # borde inferior: se arrastra para fijar el alto máximo
+        self.asa = tk.Canvas(self.root, bg=BG, height=8, highlightthickness=0, bd=0,
+                             cursor="sb_v_double_arrow")
+        self.asa.pack(side="bottom", fill="x")
+        self.asa.bind("<Enter>", lambda e: self.pintar_asa(True))
+        self.asa.bind("<Leave>", lambda e: self.pintar_asa(False))
+        self.asa.bind("<Button-1>", self.asa_inicio)
+        self.asa.bind("<B1-Motion>", self.asa_mover)
+        self.asa.bind("<ButtonRelease-1>", self.asa_fin)
+
+        self.marco = tk.Frame(self.root, bg=BG, padx=16)
+        self.marco.pack(fill="both", expand=True, pady=(14, 0))
+
+        cabecera = tk.Frame(self.marco, bg=BG)
+        cabecera.pack(fill="x", pady=(0, 4))
+        tk.Label(cabecera, text="AGENDA", bg=BG, fg=ACENTO,
+                 font=(FUENTE, 9, "bold")).pack(side="left")
+        self._hora_txt = ""
+        self.lbl_hora = tk.Label(cabecera, text="", bg=BG, fg=DIM, font=(FUENTE, 8),
+                                 cursor="hand2")
+        self.lbl_hora.pack(side="right")
+        self.lbl_hora.bind("<Button-1>", lambda e: self.actualizar())
+        self.lbl_hora.bind("<Enter>", lambda e: self.lbl_hora.configure(
+            text="↻ Actualizar ahora", fg=FG))
+        self.lbl_hora.bind("<Leave>", lambda e: self.lbl_hora.configure(
+            text=self._hora_txt, fg=DIM))
+
+        # lista de eventos con desplazamiento
+        self.lienzo = tk.Canvas(self.marco, bg=BG, highlightthickness=0, bd=0,
+                                width=ANCHO - 32, height=10, yscrollincrement=20)
+        self.lienzo.pack(fill="x")
+        self.cuerpo = tk.Frame(self.lienzo, bg=BG)
+        self.lienzo.create_window(0, 0, window=self.cuerpo, anchor="nw", width=ANCHO - 32)
+        self.cuerpo.bind("<Configure>", lambda e: self.ajustar_alto())
+        self.desborda = False
+
+        # barra fina estilo teléfono: aparece al desplazar o al pasar el mouse
+        self.barra = tk.Canvas(self.marco, bg=BG, width=6, highlightthickness=0, bd=0)
+        self.barra.bind("<Button-1>", self.barra_inicio)
+        self.barra.bind("<B1-Motion>", self.barra_mover)
+        self.barra.bind("<ButtonRelease-1>", self.barra_fin)
+        self.barra.bind("<Enter>", lambda e: self.mostrar_barra(activa=True))
+        self.barra.bind("<Leave>", lambda e: self.mostrar_barra())
+        self._ocultar_barra = None
+        self._arrastrando_barra = False
+        self.no_arrastrar = (self.barra, self.asa, self.lbl_hora)
 
         self.root.bind_all("<Button-1>", self.iniciar_arrastre)
         self.root.bind_all("<B1-Motion>", self.arrastrar)
         self.root.bind_all("<ButtonRelease-1>", self.soltar)
         self.root.bind_all("<Button-3>", self.abrir_menu)
+        self.root.bind_all("<MouseWheel>", self.rueda)
+        self.root.bind_all("<Motion>", self.al_mover_mouse)
         self.root.bind("<FocusOut>", self.al_perder_foco)
 
         threading.Thread(target=escuchar_atajo, daemon=True,
@@ -561,6 +616,7 @@ class Widget:
         self.timer = self.root.after(self.cfg["refresco_min"] * 60 * 1000, self.actualizar)
         calendarios = [dict(c) for c in self.cfg["calendarios"]]
         dias = self.cfg["dias"]
+        self.poner_hora("Actualizando…")
 
         def tarea():
             try:
@@ -580,22 +636,19 @@ class Widget:
                     self.pintar(*dato)
                 else:
                     self.pintar_mensaje("Error al leer los calendarios.")
+                    self.poner_hora("Sin actualizar")
         except queue.Empty:
             pass
         self.root.after(150, self.revisar_cola)
 
     # ── interfaz ──
+    def poner_hora(self, texto):
+        self._hora_txt = texto
+        self.lbl_hora.configure(text=texto, fg=DIM)
+
     def limpiar(self):
         for w in self.cuerpo.winfo_children():
             w.destroy()
-
-    def encabezado(self):
-        fila = tk.Frame(self.cuerpo, bg=BG)
-        fila.pack(fill="x", pady=(0, 4))
-        tk.Label(fila, text="AGENDA", bg=BG, fg=ACENTO,
-                 font=(FUENTE, 9, "bold")).pack(side="left")
-        tk.Label(fila, text=dt.datetime.now(TZ).strftime("%H:%M"), bg=BG, fg=DIM,
-                 font=(FUENTE, 8)).pack(side="right")
 
     def texto(self, contenido, color=DIM):
         tk.Label(self.cuerpo, text=contenido, bg=BG, fg=color, font=(FUENTE, 10),
@@ -603,12 +656,14 @@ class Widget:
 
     def pintar_mensaje(self, contenido):
         self.limpiar()
-        self.encabezado()
+        self.lienzo.yview_moveto(0)
         self.texto(contenido)
 
     def pintar(self, eventos, errores):
+        posicion = self.lienzo.yview()[0]
         self.limpiar()
-        self.encabezado()
+        self.poner_hora("Actualizado " + dt.datetime.now(TZ).strftime("%H:%M"))
+        self.root.after(60, lambda: self.lienzo.yview_moveto(posicion))
         if not self.cfg["calendarios"]:
             self.texto("Sin calendarios.\nClic derecho → Administrar calendarios.")
             return
@@ -641,6 +696,93 @@ class Widget:
             self.texto(f"+ {len(eventos) - MAX_EVENTOS} eventos más")
         if errores:
             self.texto("Sin conexión: " + ", ".join(errores), color="#E57373")
+
+    # ── alto y desplazamiento ──
+    def ajustar_alto(self):
+        contenido = self.cuerpo.winfo_reqheight()
+        alto = max(10, min(contenido, self.cfg.get("alto_max", ALTO_BASE)))
+        self.lienzo.configure(height=alto, scrollregion=(0, 0, ANCHO - 32, contenido))
+        self.desborda = contenido > alto + 1
+        if not self.desborda:
+            self.lienzo.yview_moveto(0)
+            self.barra.place_forget()
+        elif self.barra.winfo_ismapped():
+            self.mostrar_barra()
+
+    def mostrar_barra(self, activa=False):
+        if not self.desborda:
+            return
+        alto = int(self.lienzo.cget("height"))
+        arriba, abajo = self.lienzo.yview()
+        largo = max(28, int((abajo - arriba) * alto))
+        y = int(arriba * alto)
+        y = min(y, alto - largo)
+        self.barra.delete("all")
+        color = BARRA_ACTIVA if (activa or self._arrastrando_barra) else BARRA
+        self.barra.create_line(3, 4, 3, largo - 4, width=4, capstyle="round", fill=color)
+        self.barra.place(in_=self.lienzo, relx=1.0, x=5, y=y, width=6, height=largo)
+        if self._ocultar_barra:
+            self.root.after_cancel(self._ocultar_barra)
+        self._ocultar_barra = self.root.after(1300, self.esconder_barra)
+
+    def esconder_barra(self):
+        self._ocultar_barra = None
+        if self._arrastrando_barra:
+            return
+        x, y = self.root.winfo_pointerxy()
+        if self.root.winfo_containing(x, y) is self.barra:
+            self._ocultar_barra = self.root.after(800, self.esconder_barra)
+            return
+        self.barra.place_forget()
+
+    def rueda(self, e):
+        if not self.es_mio(e) or not self.desborda:
+            return
+        self.lienzo.yview_scroll(-2 * int(e.delta / 120) or (-1 if e.delta > 0 else 1), "units")
+        self.mostrar_barra()
+
+    def al_mover_mouse(self, e):
+        if self.desborda and self.es_mio(e) and not self.barra.winfo_ismapped():
+            self.mostrar_barra()
+
+    def barra_inicio(self, e):
+        self._arrastrando_barra = True
+        self._barra_y0 = e.y_root
+        self._barra_arriba0 = self.lienzo.yview()[0]
+
+    def barra_mover(self, e):
+        alto = int(self.lienzo.cget("height"))
+        self.lienzo.yview_moveto(self._barra_arriba0 + (e.y_root - self._barra_y0) / alto)
+        self.mostrar_barra()
+
+    def barra_fin(self, e):
+        self._arrastrando_barra = False
+        self.mostrar_barra()
+
+    def pintar_asa(self, visible):
+        self.asa.delete("all")
+        if visible:
+            centro = ANCHO // 2
+            self.asa.create_line(centro - 18, 4, centro + 18, 4, width=3,
+                                 capstyle="round", fill=BARRA)
+
+    def asa_inicio(self, e):
+        self._asa_y0 = e.y_root
+        self._asa_alto0 = int(self.lienzo.cget("height"))
+
+    def asa_mover(self, e):
+        tope = self.root.winfo_screenheight() - 160
+        nuevo = self._asa_alto0 + (e.y_root - self._asa_y0)
+        self.cfg["alto_max"] = int(max(ALTO_MIN, min(nuevo, tope)))
+        self.ajustar_alto()
+
+    def asa_fin(self, e):
+        guardar_cfg(self.cfg)
+
+    def restablecer_alto(self):
+        self.cfg["alto_max"] = ALTO_BASE
+        guardar_cfg(self.cfg)
+        self.ajustar_alto()
 
     # ── menú ──
     def abrir_menu(self, e):
@@ -675,6 +817,7 @@ class Widget:
             op.add_radiobutton(label=f"{int(p * 100)} %", value=p, variable=self._op,
                                command=self.cambiar_opacidad)
         menu.add_cascade(label="Opacidad", menu=op)
+        menu.add_command(label="Restablecer alto", command=self.restablecer_alto)
 
         menu.add_separator()
         menu.add_command(label="Ayuda", command=lambda: self.abrir_ventana(Ayuda))
@@ -744,18 +887,18 @@ class Widget:
             return False
 
     def iniciar_arrastre(self, e):
-        if not self.es_mio(e):
+        if not self.es_mio(e) or e.widget in self.no_arrastrar:
             return
         self._dx = e.x_root - self.root.winfo_x()
         self._dy = e.y_root - self.root.winfo_y()
 
     def arrastrar(self, e):
-        if not self.es_mio(e) or not hasattr(self, "_dx"):
+        if not self.es_mio(e) or e.widget in self.no_arrastrar or not hasattr(self, "_dx"):
             return
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
     def soltar(self, e):
-        if not self.es_mio(e):
+        if not self.es_mio(e) or e.widget in self.no_arrastrar:
             return
         self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
         guardar_cfg(self.cfg)

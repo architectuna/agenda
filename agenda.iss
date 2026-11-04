@@ -1,13 +1,17 @@
 ; Instalador de Agenda (Inno Setup 6)
 
 #define AppName "Agenda"
-#define AppVersion "1.2"
+#define AppVersion "1.3"
 
 [Setup]
 AppId={{6B1E7C2A-4F3D-4C1B-9A55-2E7D0A1F9C31}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher=Arquitectuna
+AppPublisherURL=https://github.com/architectuna/agenda
+AppSupportURL=https://github.com/architectuna/agenda/issues
+VersionInfoVersion=1.3.0.0
+VersionInfoDescription=Instalador de Agenda
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -20,6 +24,10 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
+; evita que se ejecuten varias copias del instalador a la vez
+SetupMutex=AgendaSetupMutex,Global\AgendaSetupMutex
+; detecta si Agenda está abierta antes de instalar o desinstalar
+AppMutex=Agenda_GCal_Widget
 
 [Languages]
 Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -29,7 +37,7 @@ Name: "inicio"; Description: "Abrir Agenda al iniciar Windows"
 Name: "escritorio"; Description: "Crear acceso directo en el escritorio"; Flags: unchecked
 
 [Files]
-Source: "dist\Agenda.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\Agenda\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\Agenda.exe"

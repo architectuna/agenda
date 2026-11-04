@@ -20,12 +20,15 @@ py -m pip install --upgrade --quiet pip
 py -m pip install --upgrade --quiet requests icalendar recurring-ical-events tzdata tzlocal pyinstaller
 if errorlevel 1 ( echo  Fallo la instalacion de librerias. & pause & exit /b 1 )
 
-py -m PyInstaller --noconfirm --clean --onefile --windowed ^
+rem --onedir: la app no se descomprime en una carpeta temporal al abrirse,
+rem arranca mas rapido y los antivirus la revisan menos.
+py -m PyInstaller --noconfirm --clean --onedir --windowed --noupx ^
     --name Agenda --icon agenda.ico --add-data "agenda.ico;." ^
+    --version-file version_info.txt ^
     --collect-data tzdata --collect-submodules icalendar --hidden-import tzlocal ^
     agenda.pyw
 if errorlevel 1 ( echo  Fallo PyInstaller. & pause & exit /b 1 )
-echo  Listo: dist\Agenda.exe
+echo  Listo: dist\Agenda\Agenda.exe
 
 echo.
 echo  === 3/3  Armando el instalador ===
@@ -35,7 +38,7 @@ if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Se
 if exist "%LocalAppData%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LocalAppData%\Programs\Inno Setup 6\ISCC.exe"
 if not defined ISCC (
     echo  No encuentro Inno Setup 6. Instalalo desde https://jrsoftware.org/isdl.php
-    echo  y volve a ejecutar esto. Mientras tanto, dist\Agenda.exe ya funciona solo.
+    echo  y volve a ejecutar esto. Mientras tanto, dist\Agenda\Agenda.exe ya funciona.
     pause & exit /b 0
 )
 "%ISCC%" /Q agenda.iss

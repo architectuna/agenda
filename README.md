@@ -10,13 +10,14 @@ Widget de escritorio para **Windows 11** que muestra los próximos eventos de tu
 - **Varios calendarios**, cada uno con su color. Los mostrás, ocultás o renombrás cuando quieras.
 - Agrupa los eventos por día ("Hoy", "Mañana", "Jueves 5 nov") y atenúa los que ya pasaron.
 - **Ctrl + Alt + A** lo trae al frente; repetirlo lo devuelve al fondo.
-- Se actualiza solo cada 10 minutos. Recuerda su posición. Opacidad y días a mostrar regulables.
+- Alto máximo ajustable; si los eventos no entran, se desplazan con una barra fina, estilo teléfono.
+- Se actualiza solo cada 10 minutos y muestra la hora de la última actualización. Recuerda su posición. Opacidad y días a mostrar regulables.
 - Solo lectura: nunca modifica tus calendarios.
 
 ## Instalación
 
 1. Descargá **`Agenda-Setup.exe`** desde [Releases](../../releases/latest).
-2. Ejecutalo. Si Windows muestra *"Windows protegió su PC"*, tocá **Más información → Ejecutar de todos modos**. Aparece porque la app no tiene firma digital paga; el código completo está en este repositorio.
+2. Ejecutalo una sola vez y esperá: algunos antivirus lo revisan antes de abrirlo y puede tardar unos segundos. Si Windows muestra *"Windows protegió su PC"*, tocá **Más información → Ejecutar de todos modos**. Aparece porque la app no tiene firma digital paga; el código completo está en este repositorio.
 3. Durante la instalación podés elegir que Agenda se abra al iniciar Windows.
 
 No necesita Python ni permisos de administrador.
@@ -44,6 +45,9 @@ Repetí con cada calendario que quieras ver.
 | Mostrar u ocultar calendarios | Clic derecho → Calendarios |
 | Renombrar o quitar | Clic derecho → Administrar calendarios |
 | Traer al frente | Ctrl + Alt + A |
+| Cambiar el alto | Arrastrar el borde inferior |
+| Desplazar la lista | Rueda del mouse o barra fina de la derecha |
+| Actualizar ahora | Clic en la hora de arriba a la derecha |
 
 **Bueno saber:** Google puede tardar varias horas en publicar los cambios en la dirección iCal, así que un evento recién creado quizá no aparezca enseguida.
 
@@ -57,7 +61,7 @@ Requiere [Python 3](https://www.python.org/downloads/) y, para el instalador, [I
 compilar.bat
 ```
 
-Genera `dist\Agenda.exe` y `instalador\Agenda-Setup.exe`.
+Genera la app en `dist\Agenda\` y el instalador en `instalador\Agenda-Setup.exe`.
 
 ## Licencia
 
