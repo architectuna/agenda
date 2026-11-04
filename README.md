@@ -20,6 +20,8 @@ Widget de escritorio para **Windows 11** que muestra los próximos eventos de tu
 2. Ejecutalo una sola vez y esperá: algunos antivirus lo revisan antes de abrirlo y puede tardar unos segundos. Si Windows muestra *"Windows protegió su PC"*, tocá **Más información → Ejecutar de todos modos**. Aparece porque la app no tiene firma digital paga; el código completo está en este repositorio.
 3. Durante la instalación podés elegir que Agenda se abra al iniciar Windows.
 
+> **Antivirus:** algunos, como Avast (*CyberCapture*), analizan durante un minuto los programas nuevos sin firma digital y muestran *"Suspicious file detected"*. Es un análisis preventivo, no una detección: al terminar, Agenda se instala y abre con normalidad.
+
 No necesita Python ni permisos de administrador.
 
 ## Agregar tus calendarios
