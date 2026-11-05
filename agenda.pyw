@@ -13,6 +13,7 @@ Uso:
 """
 import ctypes
 import ctypes.wintypes
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -29,7 +30,7 @@ import recurring_ical_events
 import requests
 
 APP = "Agenda"
-VERSION = "1.4"
+VERSION = "1.5"
 ATAJO_TEXTO = "Ctrl + Alt + A"
 
 
@@ -89,6 +90,68 @@ DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Dom
 MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
 
 
+# ───────────────────────── cifrado ─────────────────────────
+# Las direcciones secretas y la copia local de los eventos se cifran con la
+# protección de datos de Windows (DPAPI): solo el mismo usuario de Windows, en la
+# misma computadora, puede descifrarlas.
+ENTROPIA = b"Agenda-GCal-Widget"
+PREFIJO = "dpapi:"
+MAGIA = b"AGDP1\n"
+
+
+class _BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _blob(datos):
+    buffer = ctypes.create_string_buffer(datos, len(datos))
+    return _BLOB(len(datos), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char))), buffer
+
+
+def _dpapi(datos, cifrar):
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    puntero = ctypes.POINTER(_BLOB)
+    crypt32.CryptProtectData.argtypes = (puntero, ctypes.c_wchar_p, puntero, ctypes.c_void_p,
+                                         ctypes.c_void_p, ctypes.c_ulong, puntero)
+    crypt32.CryptUnprotectData.argtypes = (puntero, ctypes.c_void_p, puntero, ctypes.c_void_p,
+                                           ctypes.c_void_p, ctypes.c_ulong, puntero)
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    entrada, _b1 = _blob(datos)
+    entropia, _b2 = _blob(ENTROPIA)
+    salida = _BLOB()
+    SIN_VENTANAS = 0x1  # CRYPTPROTECT_UI_FORBIDDEN
+    if cifrar:
+        ok = crypt32.CryptProtectData(ctypes.byref(entrada), APP, ctypes.byref(entropia),
+                                      None, None, SIN_VENTANAS, ctypes.byref(salida))
+    else:
+        ok = crypt32.CryptUnprotectData(ctypes.byref(entrada), None, ctypes.byref(entropia),
+                                        None, None, SIN_VENTANAS, ctypes.byref(salida))
+    if not ok:
+        raise OSError("No se pudo " + ("cifrar" if cifrar else "descifrar"))
+    try:
+        return ctypes.string_at(salida.pbData, salida.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(salida.pbData, ctypes.c_void_p))
+
+
+def cifrar(datos):
+    return _dpapi(datos, True)
+
+
+def descifrar(datos):
+    return _dpapi(datos, False)
+
+
+def cifrar_texto(texto):
+    return PREFIJO + base64.b64encode(cifrar(texto.encode("utf-8"))).decode("ascii")
+
+
+def descifrar_texto(valor):
+    if not valor.startswith(PREFIJO):
+        raise ValueError("formato desconocido")
+    return descifrar(base64.b64decode(valor[len(PREFIJO):])).decode("utf-8")
+
+
 # ───────────────────────── configuración ─────────────────────────
 def cargar_cfg():
     cfg = json.loads(json.dumps(CFG_BASE))
@@ -97,15 +160,41 @@ def cargar_cfg():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
+    sin_cifrar = False
+    for c in cfg["calendarios"]:
+        if c.get("url_protegida"):
+            try:
+                c["url"] = descifrar_texto(c["url_protegida"])
+            except Exception:
+                # p. ej. otra computadora, otro usuario o contraseña restablecida
+                c["url"] = None
+                c["_ilegible"] = True
+        elif c.get("url"):
+            sin_cifrar = True           # configuración de una versión anterior
+    if sin_cifrar:
+        guardar_cfg(cfg)                # se reescribe cifrada
     return cfg
 
 
 def guardar_cfg(cfg):
+    datos = json.loads(json.dumps({k: v for k, v in cfg.items() if k != "calendarios"}))
+    datos["calendarios"] = []
+    for c in cfg["calendarios"]:
+        c = {k: v for k, v in c.items() if not k.startswith("_")}
+        if c.get("url"):
+            try:
+                c["url_protegida"] = cifrar_texto(c["url"])
+                del c["url"]
+            except Exception:
+                c.pop("url_protegida", None)   # sin cifrado disponible: queda como antes
+        else:
+            c.pop("url", None)                 # ilegible: se conserva lo cifrado tal cual
+        datos["calendarios"].append(c)
     try:
         os.makedirs(DIR_CFG, exist_ok=True)
         tmp = ARCH_CFG + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(datos, f, ensure_ascii=False, indent=2)
         os.replace(tmp, ARCH_CFG)
     except OSError:
         pass
@@ -131,13 +220,20 @@ def ruta_cache(url):
     return os.path.join(DIR_CACHE, clave + ".ics")
 
 
-def guardar_cache(url, contenido):
+def guardar_cache(url, contenido, momento=None):
+    try:
+        datos = MAGIA + cifrar(contenido)
+    except Exception:
+        datos = contenido                   # sin cifrado disponible
     try:
         os.makedirs(DIR_CACHE, exist_ok=True)
         ruta = ruta_cache(url)
         with open(ruta + ".tmp", "wb") as f:
-            f.write(contenido)
+            f.write(datos)
         os.replace(ruta + ".tmp", ruta)
+        if momento:                         # conserva la fecha original al migrar
+            marca = momento.timestamp()
+            os.utime(ruta, (marca, marca))
     except OSError:
         pass
 
@@ -148,9 +244,16 @@ def leer_cache(url):
     try:
         with open(ruta, "rb") as f:
             contenido = f.read()
-        return contenido, dt.datetime.fromtimestamp(os.path.getmtime(ruta), TZ)
+        momento = dt.datetime.fromtimestamp(os.path.getmtime(ruta), TZ)
     except OSError:
         return None
+    if contenido.startswith(MAGIA):
+        try:
+            return descifrar(contenido[len(MAGIA):]), momento
+        except Exception:
+            return None
+    guardar_cache(url, contenido, momento)  # copia de la v1.4, sin cifrar: se cifra
+    return contenido, momento
 
 
 def borrar_cache(url):
@@ -207,6 +310,8 @@ def leer_calendario(c, desde, hasta):
     """
     nombre = c.get("nombre", "calendario")
     color = c.get("color", ACENTO)
+    if not c.get("url"):
+        return [], {"nombre": nombre, "estado": "ilegible", "momento": None}
     try:
         contenido = bajar(c["url"])
         eventos = eventos_de(icalendar.Calendar.from_ical(contenido), color, desde, hasta)
@@ -252,14 +357,20 @@ def cuando(momento):
 
 def resumen_estado(estados):
     """Texto y color de la cabecera, y avisos para el cuerpo, según cómo salió la lectura."""
-    fallidos = [e for e in estados if e["estado"] != "ok"]
-    guardados = [e for e in fallidos if e["estado"] == "guardado"]
-    sin_datos = [e for e in fallidos if e["estado"] == "sin_datos"]
+    correctos = [e for e in estados if e["estado"] == "ok"]
+    guardados = [e for e in estados if e["estado"] == "guardado"]
+    sin_datos = [e for e in estados if e["estado"] == "sin_datos"]
+    ilegibles = [e for e in estados if e["estado"] == "ilegible"]
+    sin_red = guardados + sin_datos
     ahora = dt.datetime.now(TZ).strftime("%H:%M")
     avisos = []
-    if not fallidos:
-        return f"Actualizado {ahora}", DIM, avisos
-    if len(fallidos) < len(estados):
+    if not sin_red:
+        if correctos or not ilegibles:
+            cabecera = f"Actualizado {ahora}"
+            color = AMBAR if ilegibles else DIM
+        else:
+            cabecera, color = "Revisá tus calendarios", ROJO
+    elif correctos:
         cabecera, color = f"Actualización parcial {ahora}", AMBAR
         for e in guardados:
             avisos.append(f"«{e['nombre']}» sin conexión: se muestran sus eventos "
@@ -275,6 +386,9 @@ def resumen_estado(estados):
             cabecera = "Sin conexión"
     for e in sin_datos:
         avisos.append(f"«{e['nombre']}» sin conexión y sin eventos guardados.")
+    for e in ilegibles:
+        avisos.append(f"No se puede leer la dirección de «{e['nombre']}» en esta computadora. "
+                      "Quitalo y volvé a agregarlo (ver Ayuda).")
     return cabecera, color, avisos
 
 
@@ -466,6 +580,9 @@ class FilaCalendario(tk.Frame):
         quitar.bind("<Leave>", lambda e: quitar.configure(fg=DIM))
 
     def pintar_punto(self):
+        if self.cal.get("_ilegible"):
+            self.punto.configure(text="⚠", fg=ROJO)
+            return
         visible = self.cal.get("visible", True)
         self.punto.configure(text="●" if visible else "○",
                              fg=self.cal.get("color", ACENTO) if visible else DIM)
@@ -645,14 +762,28 @@ AYUDA = [
           "• La dirección secreta da acceso de lectura a tu calendario: no la compartas. "
           "Si se filtra, en Google podés restablecerla y volver a agregarla acá.\n"
           "• La configuración se guarda en %APPDATA%\\Agenda y la copia de los eventos "
-          "en %LOCALAPPDATA%\\Agenda; quitar un calendario borra su copia."),
+          "en %LOCALAPPDATA%\\Agenda."),
+    ("h", "Privacidad y seguridad"),
+    ("p", "• Las direcciones secretas de tus calendarios y la copia local de tus eventos se "
+          "guardan cifradas con la protección de datos de Windows. Solo tu usuario de "
+          "Windows, en esta computadora, puede leerlas.\n"
+          "• Eso evita que otras personas que usan esta computadora, una copia de respaldo o "
+          "un archivo compartido por error revelen tus calendarios. No protege contra un "
+          "programa malicioso que se ejecute dentro de tu propia sesión de Windows.\n"
+          "• La configuración no se puede copiar a otra computadora: en cada una hay que "
+          "agregar los calendarios.\n"
+          "• Si un administrador restablece tu contraseña de Windows, o si se vuelve a crear "
+          "tu usuario, Windows puede perder la clave. Agenda marca con ⚠ los calendarios que "
+          "no puede leer: quitalos y volvé a agregarlos. Cambiar tu contraseña de la forma "
+          "habitual no afecta.\n"
+          "• Al quitar un calendario se borra también su copia local."),
 ]
 
 
 class Ayuda(Ventana):
     def __init__(self, widget):
         super().__init__(widget, "Ayuda")
-        texto = tk.Text(self, width=62, height=30, bg=BG, fg=FG, bd=0, wrap="word",
+        texto = tk.Text(self, width=62, height=34, bg=BG, fg=FG, bd=0, wrap="word",
                         font=(FUENTE, 10), cursor="arrow", highlightthickness=0,
                         spacing1=1, spacing3=1)
         texto.tag_configure("h", font=(FUENTE, 11, "bold"), foreground=ACENTO,
@@ -820,7 +951,7 @@ class Widget:
                 elif tipo == "ok":
                     self.ultimos = dato
                     self.pintar(*dato)
-                    if any(e["estado"] != "ok" for e in dato[1]):
+                    if any(e["estado"] in ("guardado", "sin_datos") for e in dato[1]):
                         self.programar(REINTENTO_MIN)
                 else:
                     self.pintar_mensaje("Error al leer los calendarios.")
@@ -883,10 +1014,10 @@ class Widget:
                      font=(FUENTE, 10), anchor="w", justify="left",
                      wraplength=px(ANCHO - 125)).pack(side="left", fill="x")
 
-        con_datos = any(e["estado"] != "sin_datos" for e in estados)
+        con_datos = any(e["estado"] not in ("sin_datos", "ilegible") for e in estados)
         if not eventos and con_datos:
             self.texto(f"Nada en los próximos {self.cfg['dias']} días.")
-        elif not con_datos:
+        elif not con_datos and any(e["estado"] == "sin_datos" for e in estados):
             self.texto(f"Se volverá a intentar en {REINTENTO_MIN} minutos.")
         elif len(eventos) > MAX_EVENTOS:
             self.texto(f"+ {len(eventos) - MAX_EVENTOS} eventos más")

@@ -40,6 +40,15 @@ Repetí con cada calendario que quieras ver.
 
 > **Importante:** esa dirección permite leer tu calendario. No la compartas. Si se filtra, podés restablecerla desde la misma pantalla de Google.
 
+## Privacidad
+
+Agenda guarda las direcciones secretas y la copia local de tus eventos **cifradas con la protección de datos de Windows (DPAPI)**: solo tu usuario de Windows, en esa computadora, puede leerlas.
+
+- Protege frente a otros usuarios del equipo, copias de respaldo y archivos compartidos por error. No protege frente a un programa malicioso que se ejecute en tu propia sesión.
+- La configuración no se puede copiar a otra computadora: en cada una se agregan los calendarios.
+- Si un administrador restablece tu contraseña de Windows, o se vuelve a crear tu usuario, Windows puede perder la clave. Agenda marca con ⚠ los calendarios que no puede leer: quitalos y volvé a agregarlos. Cambiar la contraseña de la forma habitual no afecta.
+- Al actualizar desde una versión anterior, la configuración existente se cifra automáticamente.
+
 ## Uso
 
 | Acción | Cómo |
