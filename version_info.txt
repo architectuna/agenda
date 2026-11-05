@@ -1,17 +1,17 @@
 # Datos de versión que Windows muestra en Propiedades → Detalles del .exe
 VSVersionInfo(
-  ffi=FixedFileInfo(filevers=(1, 3, 0, 0), prodvers=(1, 3, 0, 0), mask=0x3f, flags=0x0,
+  ffi=FixedFileInfo(filevers=(1, 4, 0, 0), prodvers=(1, 4, 0, 0), mask=0x3f, flags=0x0,
                     OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[
     StringFileInfo([StringTable('040a04b0', [
       StringStruct('CompanyName', 'Arquitectuna'),
       StringStruct('FileDescription', 'Agenda - widget de Google Calendar'),
-      StringStruct('FileVersion', '1.3.0.0'),
+      StringStruct('FileVersion', '1.4.0.0'),
       StringStruct('InternalName', 'Agenda'),
       StringStruct('LegalCopyright', '(c) 2026 Javier Benitez - licencia MIT'),
       StringStruct('OriginalFilename', 'Agenda.exe'),
       StringStruct('ProductName', 'Agenda'),
-      StringStruct('ProductVersion', '1.3.0.0')])]),
+      StringStruct('ProductVersion', '1.4.0.0')])]),
     VarFileInfo([VarStruct('Translation', [0x040a, 1200])])
   ]
 )

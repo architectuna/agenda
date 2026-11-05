@@ -14,11 +14,13 @@ Uso:
 import ctypes
 import ctypes.wintypes
 import datetime as dt
+import hashlib
 import json
 import os
 import queue
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import messagebox
 
@@ -27,7 +29,7 @@ import recurring_ical_events
 import requests
 
 APP = "Agenda"
-VERSION = "1.3"
+VERSION = "1.4"
 ATAJO_TEXTO = "Ctrl + Alt + A"
 
 
@@ -43,6 +45,9 @@ def zona_local():
 TZ = zona_local()
 DIR_CFG = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), APP)
 ARCH_CFG = os.path.join(DIR_CFG, "config.json")
+# copia local de cada calendario, para mostrar algo cuando no hay conexión
+DIR_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or DIR_CFG, APP, "cache")
+REINTENTO_MIN = 2   # si algo falló, reintentar antes que el refresco normal
 
 CFG_BASE = {
     "calendarios": [],      # [{"nombre", "url", "color", "visible"}]
@@ -60,6 +65,8 @@ DIM = "#7A7A7A"
 ACENTO = "#FFCA01"
 CAMPO = "#1C1C1C"
 VERDE = "#81C784"
+ROJO = "#E57373"
+AMBAR = "#E0B050"
 FUENTE = "Segoe UI"
 ANCHO = 320
 MAX_EVENTOS = 120
@@ -68,6 +75,15 @@ ALTO_BASE = 520
 BARRA = "#5A5A5A"
 BARRA_ACTIVA = "#9A9A9A"
 PALETA = ["#FFCA01", "#4FC3F7", "#81C784", "#F48FB1", "#CE93D8", "#FFAB91", "#B0BEC5", "#FFF59D"]
+
+# factor de escala de Windows (1.0 = 100 %, 1.25 = 125 %…); se calcula al abrir
+E = 1.0
+
+
+def px(n):
+    """Convierte píxeles de diseño (a 100 %) en píxeles reales de la pantalla."""
+    return int(round(n * E))
+
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
@@ -96,13 +112,52 @@ def guardar_cfg(cfg):
 
 
 # ───────────────────────── calendario ─────────────────────────
-def descargar(url):
+def bajar(url):
+    """Descarga el contenido iCal de una dirección (bytes)."""
     url = url.strip()
     if url.lower().startswith("webcal://"):
         url = "https://" + url[9:]
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, timeout=(6, 20))
     r.raise_for_status()
-    return icalendar.Calendar.from_ical(r.content)
+    return r.content
+
+
+def descargar(url):
+    return icalendar.Calendar.from_ical(bajar(url))
+
+
+def ruta_cache(url):
+    clave = hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:24]
+    return os.path.join(DIR_CACHE, clave + ".ics")
+
+
+def guardar_cache(url, contenido):
+    try:
+        os.makedirs(DIR_CACHE, exist_ok=True)
+        ruta = ruta_cache(url)
+        with open(ruta + ".tmp", "wb") as f:
+            f.write(contenido)
+        os.replace(ruta + ".tmp", ruta)
+    except OSError:
+        pass
+
+
+def leer_cache(url):
+    """Devuelve (contenido, momento de la última descarga correcta) o None."""
+    ruta = ruta_cache(url)
+    try:
+        with open(ruta, "rb") as f:
+            contenido = f.read()
+        return contenido, dt.datetime.fromtimestamp(os.path.getmtime(ruta), TZ)
+    except OSError:
+        return None
+
+
+def borrar_cache(url):
+    try:
+        os.remove(ruta_cache(url))
+    except OSError:
+        pass
 
 
 def nombre_del_calendario(cal):
@@ -142,20 +197,85 @@ def eventos_de(cal, color, desde, hasta):
     return salida
 
 
+def leer_calendario(c, desde, hasta):
+    """Lee un calendario. Si no hay conexión, usa la última copia guardada.
+
+    Devuelve (eventos, estado) con estado = {"nombre", "estado", "momento"}:
+      "ok"        descargado ahora
+      "guardado"  sin conexión: eventos de la copia guardada en "momento"
+      "sin_datos" sin conexión y sin copia guardada
+    """
+    nombre = c.get("nombre", "calendario")
+    color = c.get("color", ACENTO)
+    try:
+        contenido = bajar(c["url"])
+        eventos = eventos_de(icalendar.Calendar.from_ical(contenido), color, desde, hasta)
+        guardar_cache(c["url"], contenido)
+        return eventos, {"nombre": nombre, "estado": "ok", "momento": dt.datetime.now(TZ)}
+    except Exception:
+        pass
+    copia = leer_cache(c["url"])
+    if copia:
+        try:
+            eventos = eventos_de(icalendar.Calendar.from_ical(copia[0]), color, desde, hasta)
+            return eventos, {"nombre": nombre, "estado": "guardado", "momento": copia[1]}
+        except Exception:
+            pass
+    return [], {"nombre": nombre, "estado": "sin_datos", "momento": None}
+
+
 def leer_eventos(calendarios, dias):
+    """Lee los calendarios visibles en paralelo. Devuelve (eventos, estados)."""
     desde = dt.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     hasta = desde + dt.timedelta(days=dias)
-    eventos, errores = [], []
-    for c in calendarios:
-        if not c.get("visible", True):
-            continue
-        try:
-            cal = descargar(c["url"])
-            eventos += eventos_de(cal, c.get("color", ACENTO), desde, hasta)
-        except Exception:
-            errores.append(c.get("nombre", "calendario"))
+    visibles = [c for c in calendarios if c.get("visible", True)]
+    eventos, estados = [], []
+    if visibles:
+        with ThreadPoolExecutor(max_workers=min(6, len(visibles))) as grupo:
+            for evs, estado in grupo.map(lambda c: leer_calendario(c, desde, hasta), visibles):
+                eventos += evs
+                estados.append(estado)
     eventos.sort(key=lambda e: (e["dia"], not e["todo_dia"], e["inicio"], e["titulo"]))
-    return eventos, errores
+    return eventos, estados
+
+
+def cuando(momento):
+    """«14:20», «ayer 18:30» o «3 nov 18:30»."""
+    hoy = dt.datetime.now(TZ).date()
+    hora = momento.strftime("%H:%M")
+    if momento.date() == hoy:
+        return hora
+    if momento.date() == hoy - dt.timedelta(days=1):
+        return "ayer " + hora
+    return f"{momento.day} {MESES_ES[momento.month - 1]} {hora}"
+
+
+def resumen_estado(estados):
+    """Texto y color de la cabecera, y avisos para el cuerpo, según cómo salió la lectura."""
+    fallidos = [e for e in estados if e["estado"] != "ok"]
+    guardados = [e for e in fallidos if e["estado"] == "guardado"]
+    sin_datos = [e for e in fallidos if e["estado"] == "sin_datos"]
+    ahora = dt.datetime.now(TZ).strftime("%H:%M")
+    avisos = []
+    if not fallidos:
+        return f"Actualizado {ahora}", DIM, avisos
+    if len(fallidos) < len(estados):
+        cabecera, color = f"Actualización parcial {ahora}", AMBAR
+        for e in guardados:
+            avisos.append(f"«{e['nombre']}» sin conexión: se muestran sus eventos "
+                          f"guardados de {cuando(e['momento'])}.")
+    else:
+        color = ROJO
+        if guardados:
+            mas_viejo = min(e["momento"] for e in guardados)
+            cabecera = f"Sin conexión · última correcta {cuando(mas_viejo)}"
+            avisos.append(f"Sin conexión. Se muestran los eventos guardados de "
+                          f"{cuando(mas_viejo)}; pueden estar desactualizados.")
+        else:
+            cabecera = "Sin conexión"
+    for e in sin_datos:
+        avisos.append(f"«{e['nombre']}» sin conexión y sin eventos guardados.")
+    return cabecera, color, avisos
 
 
 def etiqueta_dia(fecha):
@@ -174,6 +294,53 @@ def hwnd_de(ventana):
         return ctypes.windll.user32.GetParent(w) or w
     except Exception:
         return None
+
+
+def activar_escala():
+    """Avisa a Windows que Agenda dibuja según la escala: texto nítido a 125 % o 150 %."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", ctypes.wintypes.RECT),
+                ("rcWork", ctypes.wintypes.RECT), ("dwFlags", ctypes.c_ulong)]
+
+
+def area_de_trabajo(x, y, ancho, alto):
+    """Área útil (sin barra de tareas) del monitor más cercano al rectángulo dado."""
+    try:
+        user32 = ctypes.windll.user32
+    except AttributeError:
+        return None
+    user32.MonitorFromRect.restype = ctypes.c_void_p
+    user32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.POINTER(_MONITORINFO))
+    rect = ctypes.wintypes.RECT(x, y, x + ancho, y + alto)
+    monitor = user32.MonitorFromRect(ctypes.byref(rect), 2)  # MONITOR_DEFAULTTONEAREST
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return None
+    w = info.rcWork
+    return w.left, w.top, w.right, w.bottom
+
+
+def encajar(x, y, ancho, area, margen_cabecera=40):
+    """Si la cabecera del widget no se ve lo suficiente dentro del área, devuelve una
+    posición corregida dentro de ella; si se ve bien, devuelve None."""
+    izq, arr, der, aba = area
+    visible_x = min(x + ancho, der) - max(x, izq)
+    visible_y = min(y + margen_cabecera, aba) - max(y, arr)
+    if visible_x >= min(ancho, 80) and visible_y >= 30:
+        return None
+    nx = max(izq, min(x, der - ancho))
+    ny = max(arr, min(y, aba - 120))
+    return nx, ny
 
 
 def ruta_recurso(nombre):
@@ -240,7 +407,7 @@ def boton(padre, texto, comando, primario=False, **kw):
                      activebackground="#E6B600" if primario else "#3A3A3A",
                      activeforeground="#111111" if primario else FG,
                      font=(FUENTE, 10 if primario else 9, "bold" if primario else "normal"),
-                     padx=12, pady=6 if primario else 5, **kw)
+                     padx=px(12), pady=px(6 if primario else 5), **kw)
 
 
 class Ventana(tk.Toplevel):
@@ -249,14 +416,14 @@ class Ventana(tk.Toplevel):
         super().__init__(widget.root)
         self.widget = widget
         self.title(f"{titulo} — {APP}")
-        self.configure(bg=BG, padx=18, pady=16)
+        self.configure(bg=BG, padx=px(18), pady=px(16))
         self.resizable(False, False)
         self.attributes("-topmost", True)
         self.protocol("WM_DELETE_WINDOW", self.cerrar)
         self.bind("<Escape>", lambda e: self.cerrar())
 
     def pie(self):
-        tk.Frame(self, bg="#2A2A2A", height=1).pack(fill="x", pady=(16, 12))
+        tk.Frame(self, bg="#2A2A2A", height=1).pack(fill="x", pady=(px(16), px(12)))
         boton(self, "Listo", self.cerrar, primario=True, width=12).pack(anchor="e")
 
     def cerrar(self):
@@ -287,7 +454,7 @@ class FilaCalendario(tk.Frame):
                               insertbackground=FG, bd=0, font=(FUENTE, 10),
                               highlightthickness=1, highlightbackground=CAMPO,
                               highlightcolor="#444444")
-        self.campo.pack(side="left", fill="x", expand=True, ipady=5)
+        self.campo.pack(side="left", fill="x", expand=True, ipady=px(5))
         self.campo.bind("<Return>", lambda e: self.confirmar())
         self.var.trace_add("write", lambda *a: self.al_escribir())
 
@@ -342,7 +509,7 @@ class Administrador(Ventana):
         tk.Label(self, text="Hacé clic en un nombre para cambiarlo y confirmá con ✓ o Enter. "
                             "El punto de color muestra u oculta el calendario.",
                  bg=BG, fg=DIM, font=(FUENTE, 9), anchor="w", justify="left",
-                 wraplength=400).pack(fill="x", pady=(2, 8))
+                 wraplength=px(400)).pack(fill="x", pady=(2, px(8)))
 
         self.marco_lista = tk.Frame(self, bg=BG)
         self.marco_lista.pack(fill="x")
@@ -352,12 +519,12 @@ class Administrador(Ventana):
                  bg=BG, fg=DIM, font=(FUENTE, 9), anchor="w").pack(fill="x", pady=(16, 2))
         self.url = tk.Entry(self, width=50, bg=CAMPO, fg=FG, insertbackground=FG,
                             bd=0, font=(FUENTE, 10))
-        self.url.pack(fill="x", ipady=5)
+        self.url.pack(fill="x", ipady=px(5))
         tk.Label(self, text="Nombre (opcional; si queda vacío se toma de Google)",
                  bg=BG, fg=DIM, font=(FUENTE, 9), anchor="w").pack(fill="x", pady=(8, 2))
         self.nombre = tk.Entry(self, width=50, bg=CAMPO, fg=FG, insertbackground=FG,
                                bd=0, font=(FUENTE, 10))
-        self.nombre.pack(fill="x", ipady=5)
+        self.nombre.pack(fill="x", ipady=px(5))
         self.boton = boton(self, "Agregar calendario", self.agregar)
         self.boton.pack(anchor="w", pady=(10, 0))
         self.url.bind("<Return>", lambda e: self.agregar())
@@ -388,6 +555,7 @@ class Administrador(Ventana):
         if messagebox.askyesno("Quitar calendario", f"¿Quitar «{c['nombre']}» del widget?",
                                parent=self):
             self.guardar_pendientes()
+            borrar_cache(c["url"])
             del self.widget.cfg["calendarios"][indice]
             guardar_cfg(self.widget.cfg)
             self.refrescar_lista()
@@ -469,11 +637,15 @@ AYUDA = [
           "• Clic derecho → Días a mostrar / Opacidad.\n"
           "• Se actualiza solo cada 10 minutos, o con clic derecho → Actualizar."),
     ("h", "Bueno saber"),
-    ("p", "• Google puede demorar varias horas en publicar los cambios en la dirección "
+    ("p", "• Si no hay conexión, Agenda muestra los últimos eventos que pudo descargar y "
+          "lo indica arriba, junto con la hora de la última actualización correcta. "
+          "Vuelve a intentar cada 2 minutos.\n"
+          "• Google puede demorar varias horas en publicar los cambios en la dirección "
           "iCal; un evento recién creado quizá no aparezca enseguida.\n"
           "• La dirección secreta da acceso de lectura a tu calendario: no la compartas. "
           "Si se filtra, en Google podés restablecerla y volver a agregarla acá.\n"
-          "• La configuración se guarda en %APPDATA%\\Agenda."),
+          "• La configuración se guarda en %APPDATA%\\Agenda y la copia de los eventos "
+          "en %LOCALAPPDATA%\\Agenda; quitar un calendario borra su copia."),
 ]
 
 
@@ -506,7 +678,7 @@ class AcercaDe(Ventana):
         tk.Label(self, text="Widget de escritorio para Windows 11 que muestra los próximos "
                             "eventos de tus calendarios de Google.",
                  bg=BG, fg=FG, font=(FUENTE, 10), anchor="w", justify="left",
-                 wraplength=340).pack(fill="x", pady=(12, 10))
+                 wraplength=px(340)).pack(fill="x", pady=(px(12), px(10)))
         for etiqueta, valor in (("Autor", "Javier Benítez · Arquitectuna"),
                                 ("Datos", "Dirección iCal de Google Calendar, solo lectura"),
                                 ("Atajo", f"{ATAJO_TEXTO} para traerlo al frente"),
@@ -528,12 +700,15 @@ class Widget:
         self.timer = None
         self.admin = None
         self.ultimos = None
+        self.solicitud = 0          # número de la última actualización pedida
         self.ventanas = {}
         self.al_frente = False
         self.menu_abierto = False
         self._resultado_atajo = []
 
         self.root = tk.Tk()
+        global E
+        E = max(1.0, self.root.winfo_fpixels("1i") / 96)
         self.root.title(APP)
         self.root.overrideredirect(True)
         try:
@@ -543,10 +718,10 @@ class Widget:
         self.root.configure(bg=BG)
         self.root.attributes("-alpha", self.cfg["opacidad"])
         self.root.geometry(f"+{self.cfg['x']}+{self.cfg['y']}")
-        tk.Frame(self.root, bg=BG, width=ANCHO, height=0).pack()  # ancho fijo
+        tk.Frame(self.root, bg=BG, width=px(ANCHO), height=0).pack()  # ancho fijo
 
         # borde inferior: se arrastra para fijar el alto máximo
-        self.asa = tk.Canvas(self.root, bg=BG, height=8, highlightthickness=0, bd=0,
+        self.asa = tk.Canvas(self.root, bg=BG, width=1, height=px(8), highlightthickness=0, bd=0,
                              cursor="sb_v_double_arrow")
         self.asa.pack(side="bottom", fill="x")
         self.asa.bind("<Enter>", lambda e: self.pintar_asa(True))
@@ -555,14 +730,15 @@ class Widget:
         self.asa.bind("<B1-Motion>", self.asa_mover)
         self.asa.bind("<ButtonRelease-1>", self.asa_fin)
 
-        self.marco = tk.Frame(self.root, bg=BG, padx=16)
-        self.marco.pack(fill="both", expand=True, pady=(14, 0))
+        self.marco = tk.Frame(self.root, bg=BG, padx=px(16))
+        self.marco.pack(fill="both", expand=True, pady=(px(14), 0))
 
         cabecera = tk.Frame(self.marco, bg=BG)
-        cabecera.pack(fill="x", pady=(0, 4))
+        cabecera.pack(fill="x", pady=(0, px(4)))
         tk.Label(cabecera, text="AGENDA", bg=BG, fg=ACENTO,
                  font=(FUENTE, 9, "bold")).pack(side="left")
         self._hora_txt = ""
+        self._hora_color = DIM
         self.lbl_hora = tk.Label(cabecera, text="", bg=BG, fg=DIM, font=(FUENTE, 8),
                                  cursor="hand2")
         self.lbl_hora.pack(side="right")
@@ -570,19 +746,19 @@ class Widget:
         self.lbl_hora.bind("<Enter>", lambda e: self.lbl_hora.configure(
             text="↻ Actualizar ahora", fg=FG))
         self.lbl_hora.bind("<Leave>", lambda e: self.lbl_hora.configure(
-            text=self._hora_txt, fg=DIM))
+            text=self._hora_txt, fg=self._hora_color))
 
         # lista de eventos con desplazamiento
         self.lienzo = tk.Canvas(self.marco, bg=BG, highlightthickness=0, bd=0,
-                                width=ANCHO - 32, height=10, yscrollincrement=20)
+                                width=px(ANCHO - 32), height=10, yscrollincrement=px(20))
         self.lienzo.pack(fill="x")
         self.cuerpo = tk.Frame(self.lienzo, bg=BG)
-        self.lienzo.create_window(0, 0, window=self.cuerpo, anchor="nw", width=ANCHO - 32)
+        self.lienzo.create_window(0, 0, window=self.cuerpo, anchor="nw", width=px(ANCHO - 32))
         self.cuerpo.bind("<Configure>", lambda e: self.ajustar_alto())
         self.desborda = False
 
         # barra fina estilo teléfono: aparece al desplazar o al pasar el mouse
-        self.barra = tk.Canvas(self.marco, bg=BG, width=6, highlightthickness=0, bd=0)
+        self.barra = tk.Canvas(self.marco, bg=BG, width=px(6), highlightthickness=0, bd=0)
         self.barra.bind("<Button-1>", self.barra_inicio)
         self.barra.bind("<B1-Motion>", self.barra_mover)
         self.barra.bind("<ButtonRelease-1>", self.barra_fin)
@@ -601,50 +777,64 @@ class Widget:
         self.root.bind("<FocusOut>", self.al_perder_foco)
 
         threading.Thread(target=escuchar_atajo, daemon=True,
-                         args=(lambda: self.cola.put(("atajo", None)), self._resultado_atajo)
+                         args=(lambda: self.cola.put(("atajo", None, None)), self._resultado_atajo)
                          ).start()
 
         self.root.after(100, lambda: (bordes_redondeados(self.root), enviar_al_fondo(self.root)))
+        self.root.after(400, self.vigilar_posicion)
         self.pintar_mensaje("Cargando…")
         self.actualizar()
         self.revisar_cola()
 
     # ── datos ──
-    def actualizar(self):
+    def programar(self, minutos):
         if self.timer:
             self.root.after_cancel(self.timer)
-        self.timer = self.root.after(self.cfg["refresco_min"] * 60 * 1000, self.actualizar)
+        self.timer = self.root.after(int(minutos * 60 * 1000), self.actualizar)
+
+    def actualizar(self):
+        # cada pedido lleva un número; solo se muestra el resultado del último,
+        # así una descarga lenta anterior no pisa a una más nueva
+        self.solicitud += 1
+        numero = self.solicitud
+        self.programar(self.cfg["refresco_min"])
         calendarios = [dict(c) for c in self.cfg["calendarios"]]
         dias = self.cfg["dias"]
         self.poner_hora("Actualizando…")
 
         def tarea():
             try:
-                self.cola.put(("ok", leer_eventos(calendarios, dias)))
-            except Exception as exc:
-                self.cola.put(("error", str(exc)))
+                self.cola.put(("ok", numero, leer_eventos(calendarios, dias)))
+            except Exception:
+                self.cola.put(("error", numero, None))
         threading.Thread(target=tarea, daemon=True).start()
 
     def revisar_cola(self):
         try:
             while True:
-                tipo, dato = self.cola.get_nowait()
+                tipo, numero, dato = self.cola.get_nowait()
                 if tipo == "atajo":
                     self.alternar_frente()
+                elif numero != self.solicitud:
+                    continue                      # resultado viejo: se descarta
                 elif tipo == "ok":
                     self.ultimos = dato
                     self.pintar(*dato)
+                    if any(e["estado"] != "ok" for e in dato[1]):
+                        self.programar(REINTENTO_MIN)
                 else:
                     self.pintar_mensaje("Error al leer los calendarios.")
-                    self.poner_hora("Sin actualizar")
+                    self.poner_hora("Sin actualizar", ROJO)
+                    self.programar(REINTENTO_MIN)
         except queue.Empty:
             pass
         self.root.after(150, self.revisar_cola)
 
     # ── interfaz ──
-    def poner_hora(self, texto):
+    def poner_hora(self, texto, color=DIM):
         self._hora_txt = texto
-        self.lbl_hora.configure(text=texto, fg=DIM)
+        self._hora_color = color
+        self.lbl_hora.configure(text=texto, fg=color)
 
     def limpiar(self):
         for w in self.cuerpo.winfo_children():
@@ -652,18 +842,21 @@ class Widget:
 
     def texto(self, contenido, color=DIM):
         tk.Label(self.cuerpo, text=contenido, bg=BG, fg=color, font=(FUENTE, 10),
-                 justify="left", anchor="w", wraplength=ANCHO - 32).pack(fill="x", pady=(4, 0))
+                 justify="left", anchor="w", wraplength=px(ANCHO - 32)).pack(fill="x", pady=(px(4), 0))
 
     def pintar_mensaje(self, contenido):
         self.limpiar()
         self.lienzo.yview_moveto(0)
         self.texto(contenido)
 
-    def pintar(self, eventos, errores):
+    def pintar(self, eventos, estados):
         posicion = self.lienzo.yview()[0]
         self.limpiar()
-        self.poner_hora("Actualizado " + dt.datetime.now(TZ).strftime("%H:%M"))
+        cabecera, color, avisos = resumen_estado(estados)
+        self.poner_hora(cabecera, color)
         self.root.after(60, lambda: self.lienzo.yview_moveto(posicion))
+        for aviso in avisos:
+            self.texto(aviso, color=color)
         if not self.cfg["calendarios"]:
             self.texto("Sin calendarios.\nClic derecho → Administrar calendarios.")
             return
@@ -677,31 +870,32 @@ class Widget:
             if ev["dia"] != dia_actual:
                 dia_actual = ev["dia"]
                 tk.Label(self.cuerpo, text=etiqueta_dia(dia_actual), bg=BG, fg=FG,
-                         font=(FUENTE, 11, "bold"), anchor="w").pack(fill="x", pady=(10, 2))
+                         font=(FUENTE, 11, "bold"), anchor="w").pack(fill="x", pady=(px(10), px(2)))
             pasado = not ev["todo_dia"] and ev["fin"] < ahora
             fila = tk.Frame(self.cuerpo, bg=BG)
-            fila.pack(fill="x", pady=1)
+            fila.pack(fill="x", pady=px(1))
             tk.Label(fila, text="●", bg=BG, fg=DIM if pasado else ev["color"],
-                     font=(FUENTE, 8)).pack(side="left", anchor="n", pady=(3, 0))
+                     font=(FUENTE, 8)).pack(side="left", anchor="n", pady=(px(3), 0))
             hora = "todo el día" if ev["todo_dia"] else ev["inicio"].strftime("%H:%M")
             tk.Label(fila, text=hora, width=9, bg=BG, fg=DIM,
-                     font=(FUENTE, 9), anchor="w").pack(side="left", anchor="n", padx=(4, 0))
+                     font=(FUENTE, 9), anchor="w").pack(side="left", anchor="n", padx=(px(4), 0))
             tk.Label(fila, text=ev["titulo"], bg=BG, fg=DIM if pasado else FG,
                      font=(FUENTE, 10), anchor="w", justify="left",
-                     wraplength=ANCHO - 125).pack(side="left", fill="x")
+                     wraplength=px(ANCHO - 125)).pack(side="left", fill="x")
 
-        if not eventos:
+        con_datos = any(e["estado"] != "sin_datos" for e in estados)
+        if not eventos and con_datos:
             self.texto(f"Nada en los próximos {self.cfg['dias']} días.")
+        elif not con_datos:
+            self.texto(f"Se volverá a intentar en {REINTENTO_MIN} minutos.")
         elif len(eventos) > MAX_EVENTOS:
             self.texto(f"+ {len(eventos) - MAX_EVENTOS} eventos más")
-        if errores:
-            self.texto("Sin conexión: " + ", ".join(errores), color="#E57373")
 
     # ── alto y desplazamiento ──
     def ajustar_alto(self):
         contenido = self.cuerpo.winfo_reqheight()
-        alto = max(10, min(contenido, self.cfg.get("alto_max", ALTO_BASE)))
-        self.lienzo.configure(height=alto, scrollregion=(0, 0, ANCHO - 32, contenido))
+        alto = max(10, min(contenido, px(self.cfg.get("alto_max", ALTO_BASE))))
+        self.lienzo.configure(height=alto, scrollregion=(0, 0, px(ANCHO - 32), contenido))
         self.desborda = contenido > alto + 1
         if not self.desborda:
             self.lienzo.yview_moveto(0)
@@ -714,13 +908,14 @@ class Widget:
             return
         alto = int(self.lienzo.cget("height"))
         arriba, abajo = self.lienzo.yview()
-        largo = max(28, int((abajo - arriba) * alto))
+        largo = max(px(28), int((abajo - arriba) * alto))
         y = int(arriba * alto)
         y = min(y, alto - largo)
         self.barra.delete("all")
         color = BARRA_ACTIVA if (activa or self._arrastrando_barra) else BARRA
-        self.barra.create_line(3, 4, 3, largo - 4, width=4, capstyle="round", fill=color)
-        self.barra.place(in_=self.lienzo, relx=1.0, x=5, y=y, width=6, height=largo)
+        self.barra.create_line(px(3), px(4), px(3), largo - px(4), width=px(4), capstyle="round",
+                               fill=color)
+        self.barra.place(in_=self.lienzo, relx=1.0, x=px(5), y=y, width=px(6), height=largo)
         if self._ocultar_barra:
             self.root.after_cancel(self._ocultar_barra)
         self._ocultar_barra = self.root.after(1300, self.esconder_barra)
@@ -762,8 +957,8 @@ class Widget:
     def pintar_asa(self, visible):
         self.asa.delete("all")
         if visible:
-            centro = ANCHO // 2
-            self.asa.create_line(centro - 18, 4, centro + 18, 4, width=3,
+            centro = px(ANCHO) // 2
+            self.asa.create_line(centro - px(18), px(4), centro + px(18), px(4), width=px(3),
                                  capstyle="round", fill=BARRA)
 
     def asa_inicio(self, e):
@@ -773,7 +968,8 @@ class Widget:
     def asa_mover(self, e):
         tope = self.root.winfo_screenheight() - 160
         nuevo = self._asa_alto0 + (e.y_root - self._asa_y0)
-        self.cfg["alto_max"] = int(max(ALTO_MIN, min(nuevo, tope)))
+        # se guarda en píxeles de diseño, para que valga igual con otra escala
+        self.cfg["alto_max"] = int(max(ALTO_MIN, min(nuevo, tope) / E))
         self.ajustar_alto()
 
     def asa_fin(self, e):
@@ -905,6 +1101,23 @@ class Widget:
         if not self.al_frente:
             enviar_al_fondo(self.root)
 
+    def vigilar_posicion(self):
+        """Si cambió la configuración de pantallas y el widget quedó fuera de la vista,
+        lo trae de vuelta. Se revisa cada 30 segundos."""
+        try:
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            ancho, alto = self.root.winfo_width(), self.root.winfo_height()
+            area = area_de_trabajo(x, y, ancho, alto)
+            nueva = encajar(x, y, ancho, area) if area else None
+            if nueva:
+                self.root.geometry(f"+{nueva[0]}+{nueva[1]}")
+                self.cfg["x"], self.cfg["y"] = nueva
+                guardar_cfg(self.cfg)
+                if not self.al_frente:
+                    enviar_al_fondo(self.root)
+        finally:
+            self.root.after(30000, self.vigilar_posicion)
+
     def correr(self):
         self.root.mainloop()
 
@@ -917,4 +1130,5 @@ if __name__ == "__main__":
             raise SystemExit
     except AttributeError:
         pass
+    activar_escala()
     Widget().correr()

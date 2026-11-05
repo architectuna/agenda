@@ -1,7 +1,7 @@
 ; Instalador de Agenda (Inno Setup 6)
 
 #define AppName "Agenda"
-#define AppVersion "1.3"
+#define AppVersion "1.4"
 
 [Setup]
 AppId={{6B1E7C2A-4F3D-4C1B-9A55-2E7D0A1F9C31}
@@ -10,7 +10,7 @@ AppVersion={#AppVersion}
 AppPublisher=Arquitectuna
 AppPublisherURL=https://github.com/architectuna/agenda
 AppSupportURL=https://github.com/architectuna/agenda/issues
-VersionInfoVersion=1.3.0.0
+VersionInfoVersion=1.4.0.0
 VersionInfoDescription=Instalador de Agenda
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}

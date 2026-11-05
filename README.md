@@ -12,6 +12,8 @@ Widget de escritorio para **Windows 11** que muestra los próximos eventos de tu
 - **Ctrl + Alt + A** lo trae al frente; repetirlo lo devuelve al fondo.
 - Alto máximo ajustable; si los eventos no entran, se desplazan con una barra fina, estilo teléfono.
 - Se actualiza solo cada 10 minutos y muestra la hora de la última actualización. Recuerda su posición. Opacidad y días a mostrar regulables.
+- **Sin conexión, sigue mostrando tu agenda:** usa los últimos eventos descargados y avisa claramente desde cuándo no se actualiza.
+- Se adapta a la escala de Windows (125 %, 150 %) y vuelve a la pantalla si cambia la configuración de monitores.
 - Solo lectura: nunca modifica tus calendarios.
 
 ## Instalación
@@ -53,7 +55,7 @@ Repetí con cada calendario que quieras ver.
 
 **Bueno saber:** Google puede tardar varias horas en publicar los cambios en la dirección iCal, así que un evento recién creado quizá no aparezca enseguida.
 
-La configuración se guarda en `%APPDATA%\Agenda\config.json`.
+La configuración se guarda en `%APPDATA%\Agenda\config.json` y la copia local de los eventos, en `%LOCALAPPDATA%\Agenda\cache`.
 
 ## Compilar desde el código
 
